@@ -134,7 +134,11 @@ async def predict_single(note: NoteInput):
         logger.info("Step 3: Running model inference...")
         prediction = model_service.predict(features)
         prediction.note_id = note.note_id  # 确保note_id正确设置
-        logger.info(f"Prediction completed: CTR={prediction.ctr:.4f}")
+        logger.info(f"Prediction completed - CTR={prediction.ctr:.4f}, Like={prediction.like_rate:.4f}, "
+                   f"Fav={prediction.fav_rate:.4f}, Comment={prediction.comment_rate:.4f}, "
+                   f"Share={prediction.share_rate:.4f}, Follow={prediction.follow_rate:.4f}, "
+                   f"Interaction={prediction.interaction_rate:.4f}, CES={prediction.ces_rate:.4f}, "
+                   f"Impression={prediction.impression:.0f}, Score={prediction.sort_score2:.4f}")
         
         return prediction
         
@@ -152,11 +156,42 @@ async def predict_batch(batch: BatchNoteInput):
     try:
         logger.info(f"Received batch prediction request for {len(batch.notes)} notes")
         
-        predictions = []
-        for note in batch.notes:
-            # TODO: 优化为批量处理
-            pred = await predict_single(note)
-            predictions.append(pred)
+        # 检查服务是否初始化
+        if not all([llm_service, feature_service, model_service]):
+            logger.warning("Services not fully initialized, using sequential processing")
+            predictions = []
+            for note in batch.notes:
+                pred = await predict_single(note)
+                predictions.append(pred)
+        else:
+            # 使用批量处理
+            logger.info("Using batch processing for better performance...")
+            
+            # 1. 批量LLM标签预测
+            logger.info("Step 1: Batch predicting tags with LLM...")
+            all_tags = []
+            for note in batch.notes:
+                tags = await llm_service.predict_tags(note)
+                all_tags.append(tags)
+            
+            # 2. 批量特征工程
+            logger.info("Step 2: Batch extracting features...")
+            all_features = []
+            for note, tags in zip(batch.notes, all_tags):
+                features = await feature_service.extract_features(note, tags)
+                features['note_id'] = note.note_id
+                all_features.append(features)
+            
+            # 3. 批量模型预测（使用ModelInferenceService.predict_batch）
+            logger.info("Step 3: Running batch model inference...")
+            predictions = model_service.predict_batch(all_features)
+            
+            # 确保note_id正确设置
+            for pred, note in zip(predictions, batch.notes):
+                pred.note_id = note.note_id
+            
+            logger.info(f"Batch prediction completed for {len(predictions)} notes")
+            logger.info(f"Average CTR: {sum(p.ctr for p in predictions) / len(predictions):.4f}")
         
         return BatchPredictionOutput(
             predictions=predictions,
@@ -164,7 +199,7 @@ async def predict_batch(batch: BatchNoteInput):
         )
         
     except Exception as e:
-        logger.error(f"Batch prediction failed: {e}")
+        logger.error(f"Batch prediction failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
