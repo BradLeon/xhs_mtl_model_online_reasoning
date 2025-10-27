@@ -1,4 +1,5 @@
 import sys
+import re
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -21,6 +22,38 @@ except ImportError as e:
 
 from app.models.input_models import NoteInput, TagPrediction
 from app.utils.image_utils import decode_image
+
+
+def extract_hashtag_keywords(content: str) -> str:
+    """从content中提取#话题关键词（对齐离线训练的tag提取逻辑）
+    
+    Args:
+        content: 笔记内容文本
+        
+    Returns:
+        提取的hashtag关键词，用空格分隔
+    """
+    if not content:
+        return ""
+    
+    try:
+        # 使用正则表达式提取#话题
+        hashtag_pattern = r'#([^#\s]+)'
+        hashtags = re.findall(hashtag_pattern, content)
+        
+        # 清理和过滤hashtags
+        cleaned_hashtags = []
+        for tag in hashtags:
+            # 移除特殊字符，保留中文、英文、数字
+            clean_tag = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', tag)
+            if clean_tag and len(clean_tag) > 1:  # 至少2个字符
+                cleaned_hashtags.append(clean_tag)
+        
+        return ' '.join(cleaned_hashtags) if cleaned_hashtags else ""
+        
+    except Exception as e:
+        logger.debug(f"Failed to extract hashtag keywords: {e}")
+        return ""
 
 
 class FeaturePipeline:
@@ -73,7 +106,7 @@ class FeaturePipeline:
             tags: LLM预测的标签
             
         Returns:
-            特征字典
+            特征字典，包含原始tags信息
         """
         try:
             features = {}
@@ -81,17 +114,29 @@ class FeaturePipeline:
             # 1. 基础文本特征
             features.update(self._extract_text_features(note))
             
-            # 2. 标签特征
-            features.update(self._extract_tag_features(tags))
+            # 2. 标签特征（包含hashtag关键词提取）
+            features.update(self._extract_tag_features(note, tags))
             
             # 3. 图像特征（OCR、CN-CLIP等）
             features.update(await self._extract_image_features(note))
             
-            # 4. 多模态融合特征
+            # 4. 添加原始标签信息（保留sparse特征）
+            features.update({
+                'note_id': note.note_id,
+                'original_tags': {
+                    'intention_lv1': tags.intention_lv1,
+                    'intention_lv2': tags.intention_lv2,
+                    'taxonomy1': tags.taxonomy1,
+                    'taxonomy2': tags.taxonomy2,
+                    'taxonomy3': tags.taxonomy3,
+                    'note_marketing_integrated_level': tags.note_marketing_integrated_level,
+                }
+            })
+            
+            # 5. 多模态融合特征
             # TODO: 调用离线训练的multimodal pipeline
             
-            # TODO, 丢失了 tag等原始sparse特征
-            
+            logger.debug(f"Feature extraction completed for note {note.note_id}: {len(features)} features")
             return features
             
         except Exception as e:
@@ -146,44 +191,38 @@ class FeaturePipeline:
         
         return features
     
-    def _extract_tag_features(self, tags: TagPrediction) -> Dict[str, Any]:
-        """提取标签特征"""
-        # TODO, 此tag非彼tag。 离线训练的tag是content末尾的#话题。 
-        features = {
+    def _extract_tag_features(self, note: NoteInput, tags: TagPrediction) -> Dict[str, Any]:
+        """提取标签特征 - 正确提取hashtag关键词而非LLM预测标签"""
+        features = {}
+        
+        # 1. 存储LLM预测的分类标签（用于稀疏特征）
+        features.update({
             'intention_lv1': tags.intention_lv1,
             'intention_lv2': tags.intention_lv2,
             'taxonomy1': tags.taxonomy1,
             'taxonomy2': tags.taxonomy2,
             'taxonomy3': tags.taxonomy3,
             'note_marketing_integrated_level': tags.note_marketing_integrated_level,
-        }
+        })
         
-        # 提取标签的CLIP特征
+        # 2. 从content中提取hashtag关键词（对齐离线训练的tag特征）
+        hashtag_keywords = extract_hashtag_keywords(note.content)
+        features['tag_keywords'] = hashtag_keywords
+        
+        # 3. 对hashtag关键词提取CLIP特征（这才是真正的tag_feat）
         if self.clip_processor:
             try:
-                # 合并所有标签为文本
-                tag_texts = [
-                    tags.intention_lv1,
-                    tags.intention_lv2, 
-                    tags.taxonomy1,
-                    tags.taxonomy2,
-                    tags.taxonomy3,
-                    tags.note_marketing_integrated_level
-                ]
-                # 过滤空标签
-                valid_tags = [tag for tag in tag_texts if tag and tag.strip()]
-                
-                if valid_tags:
-                    # 组合标签文本
-                    combined_tags = ' '.join(valid_tags)
-                    tag_features = self.clip_processor.process_texts([combined_tags])
+                if hashtag_keywords and hashtag_keywords.strip():
+                    # 使用hashtag关键词提取CLIP特征
+                    tag_features = self.clip_processor.process_texts([hashtag_keywords])
                     for i, feat in enumerate(tag_features[0]):
                         features[f'tag_feat_{i}'] = float(feat)
-                    logger.debug(f"Extracted tag CLIP features from {len(valid_tags)} tags")
+                    logger.debug(f"Extracted tag CLIP features from hashtag keywords: '{hashtag_keywords}'")
                 else:
-                    # 无有效标签时使用零向量
+                    # 无hashtag关键词时使用零向量
                     for i in range(512):
                         features[f'tag_feat_{i}'] = 0.0
+                    logger.debug("No hashtag keywords found, using zero vector for tag features")
                 
             except Exception as e:
                 logger.error(f"Tag CLIP feature extraction failed: {e}")
@@ -198,107 +237,132 @@ class FeaturePipeline:
         return features
     
     async def _extract_image_features(self, note: NoteInput) -> Dict[str, Any]:
-        """提取图像特征"""
+        """提取图像特征 - 对齐multimodal_pipeline的处理流程"""
         features = {}
         
         try:
-            # 准备图片数据
-            image_urls = []
-            image_bytes_list = []
+            # 按照multimodal_pipeline的方式：先收集URLs，再统一下载，最后处理bytes
+            cover_urls = []
+            inner_image_urls = []
+            cover_image_bytes = []
+            inner_images_bytes_list = []
             
-            # 处理封面图
-            # TODO: 为了什么和multimodal_pipeline不同？  为什么要先decode再download？ 
+            # 1. 收集封面图URL和base64数据
             if note.cover_image:
                 if note.cover_image.startswith(('http://', 'https://')):
-                    image_urls.append(note.cover_image)
+                    cover_urls.append(note.cover_image)
+                    features['has_cover_image'] = 1
                 else:
-                    # base64图片直接解码
+                    # base64图片直接解码为bytes
                     cover_img = decode_image(note.cover_image)
                     if cover_img:
                         import io
                         img_bytes = io.BytesIO()
                         cover_img.save(img_bytes, format='PNG')
-                        image_bytes_list.append(img_bytes.getvalue())
+                        cover_image_bytes.append(img_bytes.getvalue())
                         features['has_cover_image'] = 1
                     else:
                         features['has_cover_image'] = 0
-                        image_bytes_list.append(None)
             else:
                 features['has_cover_image'] = 0
-                image_bytes_list.append(None)
             
-            # 处理内部图片
+            # 2. 收集内部图片URLs和base64数据
             features['num_inner_images'] = len(note.inner_images) if note.inner_images else 0
             for inner_img in (note.inner_images or []):
                 if inner_img.startswith(('http://', 'https://')):
-                    image_urls.append(inner_img)
+                    inner_image_urls.append(inner_img)
                 else:
                     inner_img_pil = decode_image(inner_img)
                     if inner_img_pil:
                         import io
                         img_bytes = io.BytesIO()
                         inner_img_pil.save(img_bytes, format='PNG')
-                        image_bytes_list.append(img_bytes.getvalue())
-                    else:
-                        image_bytes_list.append(None)
+                        inner_images_bytes_list.append(img_bytes.getvalue())
             
-            # 下载URL图片
-            if image_urls and self.image_downloader:
-                logger.info(f"Downloading {len(image_urls)} images from URLs")
-                downloaded_images = await self.image_downloader.download_batch(image_urls)
-                image_bytes_list.extend(downloaded_images)
-            
-            # 提取CLIP特征
-            if self.clip_processor and image_bytes_list:
-                # 过滤None值
-                valid_images = [img for img in image_bytes_list if img is not None]
+            # 3. 统一下载URL图片（对齐multimodal_pipeline）
+            if self.image_downloader:
+                # 下载封面图
+                if cover_urls:
+                    logger.info(f"Downloading {len(cover_urls)} cover images from URLs")
+                    downloaded_cover = await self.image_downloader.download_batch(cover_urls)
+                    cover_image_bytes.extend(downloaded_cover)
                 
-                if valid_images:
-                    logger.info(f"Extracting CLIP features from {len(valid_images)} images")
-                    
-                    # 封面图特征
-                    if len(valid_images) > 0:
-                        cover_features = self.clip_processor.process_cover_images([valid_images[0]])
+                # 下载内部图片
+                if inner_image_urls:
+                    logger.info(f"Downloading {len(inner_image_urls)} inner images from URLs")
+                    downloaded_inner = await self.image_downloader.download_batch(inner_image_urls)
+                    inner_images_bytes_list.extend(downloaded_inner)
+            
+            # 4. 提取CLIP特征（对齐multimodal_pipeline的处理方式）
+            if self.clip_processor:
+                # 处理封面图特征
+                if cover_image_bytes:
+                    # 过滤None值
+                    valid_cover_images = [img for img in cover_image_bytes if img is not None]
+                    if valid_cover_images:
+                        logger.info(f"Extracting CLIP features from {len(valid_cover_images)} cover images")
+                        cover_features = self.clip_processor.process_cover_images(valid_cover_images)
                         for i, feat in enumerate(cover_features[0]):
                             features[f'cover_image_feat_{i}'] = float(feat)
                     else:
-                        # 无图片时使用零向量
+                        # 无有效封面图时使用零向量
                         for i in range(512):
                             features[f'cover_image_feat_{i}'] = 0.0
-                    
-                    # 内部图片特征（如果有）
-                    if len(valid_images) > 1:
-                        inner_images = valid_images[1:]
-                        inner_features, _ = self.clip_processor.process_inner_images_batch(inner_images, pooling_strategy="mean")
+                else:
+                    # 无封面图时使用零向量
+                    for i in range(512):
+                        features[f'cover_image_feat_{i}'] = 0.0
+                
+                # 处理内部图片特征
+                if inner_images_bytes_list:
+                    # 过滤None值
+                    valid_inner_images = [img for img in inner_images_bytes_list if img is not None]
+                    if valid_inner_images:
+                        logger.info(f"Extracting CLIP features from {len(valid_inner_images)} inner images")
+                        inner_features, _ = self.clip_processor.process_inner_images_batch(
+                            [valid_inner_images], pooling_strategy="mean"
+                        )
                         for i, feat in enumerate(inner_features[0]):
                             features[f'inner_image_feat_{i}'] = float(feat)
                     else:
-                        # 无内部图片时使用零向量
+                        # 无有效内部图片时使用零向量
                         for i in range(512):
                             features[f'inner_image_feat_{i}'] = 0.0
                 else:
-                    logger.warning("No valid images found for CLIP processing")
-                    # 使用零向量
+                    # 无内部图片时使用零向量
                     for i in range(512):
-                        features[f'cover_image_feat_{i}'] = 0.0
                         features[f'inner_image_feat_{i}'] = 0.0
             
-            # OCR文字提取
-            if self.ocr_processor and self.ocr_processor.enabled and image_bytes_list:
-                ocr_texts = []
-                for img_bytes in image_bytes_list:
-                    if img_bytes:
-                        text, confidence = self.ocr_processor.extract_text(img_bytes)
-                        if text and confidence > 0.5:
-                            ocr_texts.append(text)
-            # TODO, 离线训练pipeline, cover_image_ocr_texts , inner_images_ocr_texts，而不是ocr_text
-
-                features['ocr_text'] = ' '.join(ocr_texts)
-                features['ocr_text_length'] = len(features['ocr_text'])
-                logger.info(f"Extracted OCR text: {len(ocr_texts)} segments")
+            # 5. OCR文字提取（对齐multimodal_pipeline的分离处理）
+            if self.ocr_processor and self.ocr_processor.enabled:
+                # 处理封面图OCR
+                cover_ocr_texts = []
+                cover_ocr_confidences = []
+                if cover_image_bytes:
+                    cover_ocr_texts, cover_ocr_confidences = self.ocr_processor.extract_batch_texts(cover_image_bytes)
+                
+                # 处理内部图片OCR
+                inner_ocr_texts = []
+                inner_ocr_confidences = []
+                if inner_images_bytes_list:
+                    inner_ocr_texts, inner_ocr_confidences = self.ocr_processor.extract_inner_images_ocr([inner_images_bytes_list])
+                    # extract_inner_images_ocr返回的是列表的列表，需要展平
+                    if inner_ocr_texts and len(inner_ocr_texts) > 0:
+                        inner_ocr_texts = inner_ocr_texts[0] if isinstance(inner_ocr_texts[0], list) else inner_ocr_texts
+                        inner_ocr_confidences = inner_ocr_confidences[0] if isinstance(inner_ocr_confidences[0], list) else inner_ocr_confidences
+                
+                # 分别存储OCR结果（对齐multimodal_pipeline）
+                features['cover_image_ocr_texts'] = ' '.join(cover_ocr_texts) if cover_ocr_texts else ''
+                features['inner_images_ocr_texts'] = ' '.join(inner_ocr_texts) if inner_ocr_texts else ''
+                features['cover_image_ocr_confidences'] = cover_ocr_confidences[0] if cover_ocr_confidences else 0.0
+                features['inner_images_ocr_confidences'] = inner_ocr_confidences[0] if inner_ocr_confidences else 0.0
+                
+                logger.info(f"Extracted OCR text - Cover: {len(cover_ocr_texts)} segments, Inner: {len(inner_ocr_texts)} segments")
             else:
-                features['ocr_text'] = ''
-                features['ocr_text_length'] = 0
+                features['cover_image_ocr_texts'] = ''
+                features['inner_images_ocr_texts'] = ''
+                features['cover_image_ocr_confidences'] = 0.0
+                features['inner_images_ocr_confidences'] = 0.0
             
         except Exception as e:
             logger.error(f"Image feature extraction failed: {e}", exc_info=True)

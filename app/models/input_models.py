@@ -5,7 +5,7 @@ from typing import List, Optional
 class NoteInput(BaseModel):
     """小红书笔记输入模型"""
     title: str = Field(..., description="笔记标题")
-    cover_image: str = Field(..., description="封面图片(base64编码或URL)")
+    cover_image: Optional[str] = Field(default=None, description="封面图片(base64编码或URL，可选)")
     content: str = Field(..., description="笔记内容")
     inner_images: Optional[List[str]] = Field(default=[], description="内部图片列表(base64编码或URL)")
     note_id: Optional[str] = Field(default=None, description="笔记ID(可选，用于批量预测时标识)")

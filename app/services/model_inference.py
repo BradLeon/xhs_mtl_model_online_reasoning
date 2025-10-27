@@ -45,7 +45,7 @@ class ModelInferenceService:
         self._load_preprocessors()
     
     def _load_model(self):
-        """加载MMOE模型"""
+        """加载PNN_MMOE模型"""
         if not TORCH_AVAILABLE:
             logger.warning("PyTorch not available, skipping model loading")
             return
@@ -56,22 +56,122 @@ class ModelInferenceService:
                 logger.warning(f"Model file not found: {model_path}")
                 return
             
-            # 加载模型
-            # TODO, 模型加载为什么没有用？
+            # 加载模型checkpoint
+            logger.info(f"Loading model checkpoint from {model_path}")
             checkpoint = torch.load(model_path, map_location=self.device)
             
-            # TODO: 根据实际模型结构初始化模型
-            # from models.mmoe import MMOEModel
-            # self.model = MMOEModel(...)
-            # self.model.load_state_dict(checkpoint['model_state_dict'])
-            # self.model.to(self.device)
-            # self.model.eval()
+            # 初始化PNN_MMOE模型
+            # 需要导入模型类
+            import sys
+            from pathlib import Path
+            offline_path = Path(__file__).parent.parent.parent / "offline_training"
+            sys.path.insert(0, str(offline_path))
             
-            logger.info(f"Model loaded from {model_path}")
-            logger.info(f"Using device: {self.device}")
+            from offline_training.training.base.pnn_mmoe_model import PNN_MMOE
+            from deepctr_torch.inputs import SparseFeat, DenseFeat
+            
+            # 从checkpoint中获取模型配置（如果有的话）
+            if 'model_config' in checkpoint:
+                model_config = checkpoint['model_config']
+                logger.info("Using model config from checkpoint")
+            else:
+                # 使用默认配置
+                logger.warning("No model config in checkpoint, using default config")
+                model_config = {
+                    'num_tasks': 10,  # 默认10个任务
+                    'task_types': ['regression'] * 10,
+                    'task_names': ['ctr', 'like_rate', 'fav_rate', 'comment_rate', 'share_rate', 
+                                 'follow_rate', 'interaction_rate', 'ces_rate', 'impression_log', 'sort_score2'],
+                    'num_experts': 3,
+                    'expert_dnn_hidden_units': (128, 64),
+                    'gate_dnn_hidden_units': (64,),
+                    'tower_dnn_hidden_units': (64, 32),
+                }
+            
+            # 从checkpoint中获取特征列配置
+            if 'feature_columns' in checkpoint:
+                feature_columns = checkpoint['feature_columns']
+                logger.info(f"Using feature columns from checkpoint: {len(feature_columns)} features")
+            else:
+                # 构建默认特征列配置
+                logger.warning("No feature columns in checkpoint, constructing default config")
+                feature_columns = self._construct_default_feature_columns()
+            
+            # 初始化PNN_MMOE模型
+            self.model = PNN_MMOE(
+                dnn_feature_columns=feature_columns,
+                num_tasks=model_config['num_tasks'],
+                task_types=model_config['task_types'],
+                task_names=model_config['task_names'],
+                num_experts=model_config['num_experts'],
+                expert_dnn_hidden_units=model_config['expert_dnn_hidden_units'],
+                gate_dnn_hidden_units=model_config['gate_dnn_hidden_units'],
+                tower_dnn_hidden_units=model_config['tower_dnn_hidden_units'],
+                device=str(self.device)
+            )
+            
+            # 加载模型权重
+            if 'model_state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                logger.info("Loaded model state dict from checkpoint")
+            elif 'state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['state_dict'])
+                logger.info("Loaded state dict from checkpoint")
+            else:
+                logger.warning("No model weights found in checkpoint")
+                return
+            
+            # 设置为评估模式
+            self.model.to(self.device)
+            self.model.eval()
+            
+            logger.info(f"✅ PNN_MMOE model loaded successfully from {model_path}")
+            logger.info(f"Model device: {self.device}")
+            logger.info(f"Model tasks: {model_config['task_names']}")
             
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
+            logger.error(f"Failed to load PNN_MMOE model: {e}", exc_info=True)
+            self.model = None
+    
+    def _construct_default_feature_columns(self):
+        """构建默认特征列配置"""
+        try:
+            from deepctr_torch.inputs import SparseFeat, DenseFeat
+            
+            feature_columns = []
+            
+            # 稀疏特征
+            sparse_features = [
+                'intention_lv1', 'intention_lv2', 'taxonomy1', 'taxonomy2', 'taxonomy3',
+                'note_marketing_integrated_level'
+            ]
+            
+            for feat_name in sparse_features:
+                # 使用默认vocabulary_size和embedding_dim
+                feature_columns.append(SparseFeat(feat_name, vocabulary_size=100, embedding_dim=8))
+            
+            # 密集特征（基础特征）
+            dense_features = [
+                'title_length', 'content_length', 'has_cover_image', 'num_inner_images',
+                'cover_image_ocr_confidences', 'inner_images_ocr_confidences'
+            ]
+            
+            for feat_name in dense_features:
+                feature_columns.append(DenseFeat(feat_name, 1))
+            
+            # CLIP特征（512维每种）
+            clip_feature_types = ['title_feat', 'content_feat', 'cover_image_feat', 'inner_image_feat', 'tag_feat']
+            for feat_type in clip_feature_types:
+                for i in range(512):
+                    feat_name = f'{feat_type}_{i}'
+                    feature_columns.append(DenseFeat(feat_name, 1))
+            
+            logger.info(f"Constructed default feature columns: {len(feature_columns)} features")
+            return feature_columns
+            
+        except Exception as e:
+            logger.error(f"Failed to construct default feature columns: {e}")
+            return []
     
     def _load_preprocessors(self):
         """加载预处理器"""
@@ -113,14 +213,19 @@ class ModelInferenceService:
             # 特征预处理
             processed_features = self._preprocess_features(features)
             
-            # 转换为tensor
+            if not processed_features:
+                logger.error("Feature preprocessing returned empty features")
+                return self._get_mock_prediction(note_id)
+            
+            # 准备DeepCTR格式的输入（BaseModel.predict接受numpy数组或字典）
             if TORCH_AVAILABLE:
-                input_tensor = torch.FloatTensor(processed_features).to(self.device)
+                # BaseModel.predict接受字典格式的numpy数组
+                model_input = {}
+                for feat_name, feat_values in processed_features.items():
+                    model_input[feat_name] = feat_values  # 保持numpy格式
                 
-                # 模型推理
-                # TODO, 为社么不用model.predict(input_tensor)？ 
-                with torch.no_grad():
-                    outputs = self.model(input_tensor)
+                # 模型推理 - 使用BaseModel.predict方法
+                outputs = self.model.predict(model_input, batch_size=1)
                 
                 # 后处理
                 predictions = self._postprocess_predictions(outputs, note_id)
@@ -152,39 +257,147 @@ class ModelInferenceService:
         
         return predictions
     
-    def _preprocess_features(self, features: Dict) -> np.ndarray:
+    def _preprocess_features(self, features: Dict) -> Dict[str, np.ndarray]:
         """
-        特征预处理
+        特征预处理 - 参考BaseMTLFeatureProcessor.prepare_features的处理流程
         
         Args:
-            features: 原始特征
+            features: 原始特征字典
             
         Returns:
-            处理后的特征数组
+            处理后的模型输入字典
         """
-        # TODO: 使用加载的preprocessors进行特征预处理
-        # 这里需要与离线训练保持一致
-        
-        # TODO, 应当参考 BaseMTLFeatureProcessor.prepare_features对特征的预处理
-
-        # 临时返回随机数组
-        return np.random.randn(1, 100)
+        try:
+            # 导入必要的模块
+            import pandas as pd
+            from pathlib import Path
+            import sys
+            
+            offline_path = Path(__file__).parent.parent.parent / "offline_training"
+            sys.path.insert(0, str(offline_path))
+            
+            from offline_training.training.base.feature_processor import BaseMTLFeatureProcessor
+            
+            # 将features字典转换为DataFrame（单行数据）
+            df_data = {}
+            for key, value in features.items():
+                if key == 'original_tags':
+                    # 展开original_tags到顶级
+                    if isinstance(value, dict):
+                        df_data.update(value)
+                elif key != 'note_id':  # 排除note_id
+                    df_data[key] = [value] if not isinstance(value, list) else value
+            
+            # 确保所有值都是单元素列表
+            for key, value in df_data.items():
+                if not isinstance(value, list):
+                    df_data[key] = [value]
+            
+            df = pd.DataFrame(df_data)
+            
+            # 如果有预加载的preprocessors，直接使用
+            if self.preprocessors and hasattr(self.preprocessors, 'prepare_features'):
+                logger.info("Using preloaded feature processor")
+                model_input, feature_columns, feature_info = self.preprocessors.prepare_features(df)
+            else:
+                # 创建临时特征处理器
+                logger.info("Creating temporary feature processor for inference")
+                feature_processor = BaseMTLFeatureProcessor(
+                    filter_zeros=False,  # 推理时不过滤零特征
+                    use_pca=False,       # 推理时不使用PCA（除非有预训练的PCA）
+                    pca_components=256
+                )
+                
+                # 如果有预加载的label_encoders和scalers，设置到processor
+                if self.preprocessors and isinstance(self.preprocessors, dict):
+                    if 'label_encoders' in self.preprocessors:
+                        feature_processor.label_encoders = self.preprocessors['label_encoders']
+                    if 'scalers' in self.preprocessors:
+                        feature_processor.scalers = self.preprocessors['scalers']
+                    if 'pca_transformers' in self.preprocessors:
+                        feature_processor.pca_transformers = self.preprocessors['pca_transformers']
+                
+                model_input, feature_columns, feature_info = feature_processor.prepare_features(df)
+            
+            logger.info(f"Feature preprocessing completed: {len(model_input)} feature tensors")
+            logger.debug(f"Feature names: {list(model_input.keys())[:10]}...")  # 显示前10个特征名
+            
+            return model_input
+            
+        except Exception as e:
+            logger.error(f"Feature preprocessing failed: {e}", exc_info=True)
+            
+            # 回退方案：构建基本特征输入
+            logger.warning("Using fallback feature preprocessing")
+            return self._fallback_feature_preprocessing(features)
     
-    def _postprocess_predictions(self, outputs: torch.Tensor, note_id: Optional[str] = None) -> PredictionOutput:
+    def _fallback_feature_preprocessing(self, features: Dict) -> Dict[str, np.ndarray]:
+        """回退方案的特征预处理"""
+        try:
+            model_input = {}
+            
+            # 稀疏特征（简单编码）
+            sparse_features = ['intention_lv1', 'intention_lv2', 'taxonomy1', 'taxonomy2', 'taxonomy3',
+                             'note_marketing_integrated_level']
+            
+            for feat_name in sparse_features:
+                if feat_name in features:
+                    # 简单哈希编码
+                    value = str(features[feat_name])
+                    encoded_value = hash(value) % 100  # 限制在0-99范围
+                    model_input[feat_name] = np.array([encoded_value], dtype=np.float32)
+                else:
+                    model_input[feat_name] = np.array([0], dtype=np.float32)
+            
+            # 密集特征
+            dense_features = ['title_length', 'content_length', 'has_cover_image', 'num_inner_images',
+                            'cover_image_ocr_confidences', 'inner_images_ocr_confidences']
+            
+            for feat_name in dense_features:
+                if feat_name in features:
+                    value = float(features[feat_name]) if features[feat_name] is not None else 0.0
+                    model_input[feat_name] = np.array([value], dtype=np.float32)
+                else:
+                    model_input[feat_name] = np.array([0.0], dtype=np.float32)
+            
+            # CLIP特征
+            clip_feature_types = ['title_feat', 'content_feat', 'cover_image_feat', 'inner_image_feat', 'tag_feat']
+            for feat_type in clip_feature_types:
+                for i in range(512):
+                    feat_name = f'{feat_type}_{i}'
+                    if feat_name in features:
+                        value = float(features[feat_name])
+                        model_input[feat_name] = np.array([value], dtype=np.float32)
+                    else:
+                        model_input[feat_name] = np.array([0.0], dtype=np.float32)
+            
+            logger.info(f"Fallback preprocessing created {len(model_input)} features")
+            return model_input
+            
+        except Exception as e:
+            logger.error(f"Fallback feature preprocessing failed: {e}")
+            # 返回空字典，让上层处理
+            return {}
+    
+    def _postprocess_predictions(self, outputs, note_id: Optional[str] = None) -> PredictionOutput:
         """
         后处理模型输出
         
         Args:
-            outputs: 模型原始输出
+            outputs: 模型原始输出 (numpy数组，来自BaseModel.predict)
             note_id: 笔记ID
             
         Returns:
             格式化的预测结果
         """
         try:
-            if TORCH_AVAILABLE:
-                # 假设模型输出10个目标的预测值
-                predictions = outputs.cpu().numpy().flatten()
+            if TORCH_AVAILABLE and outputs is not None:
+                # BaseModel.predict返回numpy数组，直接处理
+                if isinstance(outputs, np.ndarray):
+                    predictions = outputs.flatten()
+                else:
+                    # 如果是tensor，转换为numpy
+                    predictions = outputs.cpu().numpy().flatten() if hasattr(outputs, 'cpu') else np.array(outputs).flatten()
                 
                 # impression_log转换为impression
                 impression_log = predictions[8] if len(predictions) > 8 else 0
