@@ -1,0 +1,12 @@
+# 最小依赖 - 仅运行基本服务
+fastapi
+uvicorn[standard]
+pydantic
+loguru
+httpx
+requests
+python-dotenv
+python-multipart
+Pillow
+pandas
+numpy

@@ -1,0 +1,3 @@
+[submodule "offline_training"]
+	path = offline_training
+	url = https://github.com/BradLeon/xhs_mtl_model_offline_training.git
