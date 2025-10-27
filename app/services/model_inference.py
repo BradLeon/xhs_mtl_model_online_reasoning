@@ -57,6 +57,7 @@ class ModelInferenceService:
                 return
             
             # 加载模型
+            # TODO, 模型加载为什么没有用？
             checkpoint = torch.load(model_path, map_location=self.device)
             
             # TODO: 根据实际模型结构初始化模型
@@ -74,6 +75,7 @@ class ModelInferenceService:
     
     def _load_preprocessors(self):
         """加载预处理器"""
+        # TODO: 预处理的作用是什么？
         try:
             preprocessor_path = Path(config.PREPROCESSOR_PATH)
             if not preprocessor_path.exists():
@@ -99,27 +101,38 @@ class ModelInferenceService:
             预测结果
         """
         try:
+            note_id = features.get('note_id')
+            
             if self.model is None:
                 # 如果模型未加载，返回模拟数据
-                return self._get_mock_prediction(features.get('note_id'))
+                logger.info("Model not loaded, using mock prediction")
+                return self._get_mock_prediction(note_id)
+            
+            logger.info(f"Starting model inference for note: {note_id}")
             
             # 特征预处理
             processed_features = self._preprocess_features(features)
             
             # 转换为tensor
-            input_tensor = torch.FloatTensor(processed_features).to(self.device)
+            if TORCH_AVAILABLE:
+                input_tensor = torch.FloatTensor(processed_features).to(self.device)
+                
+                # 模型推理
+                # TODO, 为社么不用model.predict(input_tensor)？ 
+                with torch.no_grad():
+                    outputs = self.model(input_tensor)
+                
+                # 后处理
+                predictions = self._postprocess_predictions(outputs, note_id)
+            else:
+                logger.warning("PyTorch not available, using mock prediction")
+                predictions = self._get_mock_prediction(note_id)
             
-            # 模型推理
-            with torch.no_grad():
-                outputs = self.model(input_tensor)
-            
-            # 后处理
-            predictions = self._postprocess_predictions(outputs)
-            
+            logger.info(f"Model inference completed for note: {note_id}")
             return predictions
             
         except Exception as e:
-            logger.error(f"Prediction failed: {e}")
+            logger.error(f"Prediction failed: {e}", exc_info=True)
             return self._get_mock_prediction(features.get('note_id'))
     
     def predict_batch(self, features_list: List[Dict]) -> List[PredictionOutput]:
@@ -152,40 +165,50 @@ class ModelInferenceService:
         # TODO: 使用加载的preprocessors进行特征预处理
         # 这里需要与离线训练保持一致
         
+        # TODO, 应当参考 BaseMTLFeatureProcessor.prepare_features对特征的预处理
+
         # 临时返回随机数组
         return np.random.randn(1, 100)
     
-    def _postprocess_predictions(self, outputs: torch.Tensor) -> PredictionOutput:
+    def _postprocess_predictions(self, outputs: torch.Tensor, note_id: Optional[str] = None) -> PredictionOutput:
         """
         后处理模型输出
         
         Args:
             outputs: 模型原始输出
+            note_id: 笔记ID
             
         Returns:
             格式化的预测结果
         """
-        # TODO: 根据实际模型输出格式进行后处理
-        
-        # 假设模型输出10个目标的预测值
-        predictions = outputs.cpu().numpy().flatten()
-        
-        # impression_log转换为impression
-        impression_log = predictions[8] if len(predictions) > 8 else 0
-        impression = np.exp(impression_log)
-        
-        return PredictionOutput(
-            ctr=float(predictions[0]) if len(predictions) > 0 else 0.05,
-            like_rate=float(predictions[1]) if len(predictions) > 1 else 0.1,
-            fav_rate=float(predictions[2]) if len(predictions) > 2 else 0.08,
-            comment_rate=float(predictions[3]) if len(predictions) > 3 else 0.03,
-            share_rate=float(predictions[4]) if len(predictions) > 4 else 0.02,
-            follow_rate=float(predictions[5]) if len(predictions) > 5 else 0.01,
-            interaction_rate=float(predictions[6]) if len(predictions) > 6 else 0.15,
-            ces_rate=float(predictions[7]) if len(predictions) > 7 else 0.06,
-            impression=float(impression),
-            sort_score2=float(predictions[9]) if len(predictions) > 9 else 0.75
-        )
+        try:
+            if TORCH_AVAILABLE:
+                # 假设模型输出10个目标的预测值
+                predictions = outputs.cpu().numpy().flatten()
+                
+                # impression_log转换为impression
+                impression_log = predictions[8] if len(predictions) > 8 else 0
+                impression = np.exp(impression_log)
+                
+                return PredictionOutput(
+                    note_id=note_id,
+                    ctr=float(predictions[0]) if len(predictions) > 0 else 0.05,
+                    like_rate=float(predictions[1]) if len(predictions) > 1 else 0.1,
+                    fav_rate=float(predictions[2]) if len(predictions) > 2 else 0.08,
+                    comment_rate=float(predictions[3]) if len(predictions) > 3 else 0.03,
+                    share_rate=float(predictions[4]) if len(predictions) > 4 else 0.02,
+                    follow_rate=float(predictions[5]) if len(predictions) > 5 else 0.01,
+                    interaction_rate=float(predictions[6]) if len(predictions) > 6 else 0.15,
+                    ces_rate=float(predictions[7]) if len(predictions) > 7 else 0.06,
+                    impression=float(impression),
+                    sort_score2=float(predictions[9]) if len(predictions) > 9 else 0.75
+                )
+            else:
+                return self._get_mock_prediction(note_id)
+                
+        except Exception as e:
+            logger.error(f"Postprocess failed: {e}")
+            return self._get_mock_prediction(note_id)
     
     def _get_mock_prediction(self, note_id: Optional[str] = None) -> PredictionOutput:
         """

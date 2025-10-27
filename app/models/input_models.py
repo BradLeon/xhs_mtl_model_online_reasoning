@@ -58,4 +58,4 @@ class TagPrediction(BaseModel):
     taxonomy1: str = Field(..., description="一级分类")
     taxonomy2: str = Field(..., description="二级分类")
     taxonomy3: str = Field(..., description="三级分类")
-    note_marketing_integrated_level: str = Field(..., description="营销集成度")
+    note_marketing_integrated_level: str = Field(..., description="内容营销感")
