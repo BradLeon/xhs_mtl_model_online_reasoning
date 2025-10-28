@@ -20,16 +20,17 @@ class Config:
     # OpenRouter API配置
     OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
     OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-    LLM_MODEL = "google/gemini-2.0-flash-exp:free"  # 使用免费模型进行测试
+    LLM_MODEL = "google/gemini-2.5-flash-lite"  # 使用免费模型进行测试
     
-    # 模型路径配置
+    # 模型路径配置 - 使用项目内相对路径
+    PROJECT_ROOT = Path(__file__).parent.parent.parent
     MODEL_PATH = os.getenv(
         "MODEL_PATH",
-        "/Volumes/ORICO/xhs_ctr_model/pnn_mmoe_model_20251023_115345.pth"
+        str(PROJECT_ROOT / "models" / "pnn_mmoe_model.pth")
     )
     PREPROCESSOR_PATH = os.getenv(
-        "PREPROCESSOR_PATH",
-        "/Volumes/ORICO/xhs_ctr_model/pnn_mmoe_preprocessors_20251023_115345.pkl"
+        "PREPROCESSOR_PATH", 
+        str(PROJECT_ROOT / "models" / "pnn_mmoe_preprocessors.pkl")
     )
     
     # 离线训练代码路径
