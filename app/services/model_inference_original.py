@@ -31,66 +31,6 @@ from app.utils.config import config
 from app.models.input_models import PredictionOutput
 
 
-# ========== MPS Compatibility Patch ==========
-# Fix for MPS (Apple Silicon) devices: DeepCTR-Torch's BaseModel.predict()
-# has multiple float64 issues that break MPS compatibility
-if TORCH_AVAILABLE:
-    from deepctr_torch.models.basemodel import BaseModel
-    from torch.utils.data import DataLoader
-    from torch.utils import data as Data
-
-    _original_deepctr_predict = BaseModel.predict
-
-    def _mps_safe_predict(self, x, batch_size=256):
-        """MPS-compatible reimplementation of BaseModel.predict()
-
-        Fixes multiple float64 issues:
-        1. np.concatenate defaults to float64
-        2. torch.from_numpy preserves float64
-        3. Final .astype("float64") conversion
-        """
-        model = self.eval()
-
-        # Convert dict to list of arrays
-        if isinstance(x, dict):
-            x = [x[feature] for feature in self.feature_index]
-
-        # Ensure all inputs are float32 numpy arrays
-        for i in range(len(x)):
-            if len(x[i].shape) == 1:
-                x[i] = np.expand_dims(x[i], axis=1)
-            # Force float32 for MPS compatibility
-            if x[i].dtype == np.float64:
-                x[i] = x[i].astype(np.float32)
-
-        # Concatenate with explicit float32 dtype
-        concatenated = np.concatenate(x, axis=-1)
-        if concatenated.dtype == np.float64:
-            logger.debug("🔄 Converting concatenated features from float64 to float32")
-            concatenated = concatenated.astype(np.float32)
-
-        # Create tensor dataset
-        tensor_data = Data.TensorDataset(torch.from_numpy(concatenated))
-        test_loader = DataLoader(dataset=tensor_data, shuffle=False, batch_size=batch_size)
-
-        # Run predictions
-        pred_ans = []
-        with torch.no_grad():
-            for _, x_test in enumerate(test_loader):
-                x_batch = x_test[0].to(self.device).float()
-                y_pred = model(x_batch).cpu().data.numpy()
-                pred_ans.append(y_pred)
-
-        # Return float32 predictions instead of float64
-        result = np.concatenate(pred_ans).astype(np.float32)
-        logger.debug(f"✅ MPS-safe predict completed, output dtype: {result.dtype}")
-        return result
-
-    BaseModel.predict = _mps_safe_predict
-    logger.info("✅ Applied comprehensive MPS compatibility patch to DeepCTR BaseModel")
-# ========== End MPS Compatibility Patch ==========
-
-
 class ModelInferenceService:
     """模型推理服务
     
@@ -420,31 +360,20 @@ class ModelInferenceService:
         
         try:
             logger.info(f"🔮 Starting model inference for note: {note_id}")
-
+            
             # 预处理特征
-            logger.debug("Step 1: Starting _preprocess_features...")
             processed_features = self._preprocess_features(features)
-            logger.debug(f"Step 1 ✅: _preprocess_features completed, feature dtypes: {[f.dtype for f in processed_features.values() if isinstance(f, np.ndarray)][:5]}")
-
+            
             # 执行预测
-            logger.debug("Step 2: Starting model.predict...")
             with torch.no_grad():
                 predictions = self.model.predict(processed_features, batch_size=1)
-            logger.debug(f"Step 2 ✅: model.predict completed, predictions dtype: {predictions.dtype if isinstance(predictions, np.ndarray) else type(predictions)}")
-
-            # Safety check: Convert any remaining float64 to float32 for MPS compatibility
-            if isinstance(predictions, np.ndarray) and predictions.dtype == np.float64:
-                logger.warning("⚠️ Predictions still in float64 after patch, converting to float32")
-                predictions = predictions.astype(np.float32)
-
+            
             # 后处理预测结果
-            logger.debug("Step 3: Starting _postprocess_predictions...")
             result = self._postprocess_predictions(predictions, note_id)
-            logger.debug("Step 3 ✅: _postprocess_predictions completed")
-
+            
             logger.info(f"✅ Model inference completed for note: {note_id}")
             return result
-
+            
         except Exception as e:
             logger.error(f"❌ Prediction failed for note {note_id}: {e}", exc_info=True)
             return self._get_mock_prediction(note_id)
@@ -499,232 +428,26 @@ class ModelInferenceService:
             logger.error(f"❌ Batch prediction failed: {e}", exc_info=True)
             return [self._get_mock_prediction(f.get('note_id')) for f in features_list]
     
-    def _get_sparse_and_dense_features(self):
-        """从 feature_columns 中识别稀疏和密集特征"""
-        sparse_features = []
-        dense_features = []
-
-        for feat_info in self.feature_columns:
-            feat_name = feat_info['name']
-            feat_type = feat_info['type']
-
-            if feat_type == 'SparseFeat':
-                sparse_features.append(feat_name)
-            elif feat_type == 'DenseFeat':
-                dense_features.append(feat_name)
-
-        return sparse_features, dense_features
-
-    def _apply_label_encoder(self, feature_name: str, value):
-        """应用 LabelEncoder 到稀疏特征"""
-        try:
-            if not self.preprocessors or 'label_encoders' not in self.preprocessors:
-                logger.warning(f"No label encoders available, returning default for {feature_name}")
-                return 0
-
-            encoder = self.preprocessors['label_encoders'].get(feature_name)
-            if encoder is None:
-                logger.warning(f"No encoder found for feature {feature_name}, using default 0")
-                return 0
-
-            # 处理字符串值
-            if isinstance(value, str):
-                try:
-                    encoded_value = encoder.transform([value])[0]
-                    return int(encoded_value)
-                except (ValueError, KeyError) as e:
-                    # 未知类别，返回默认值
-                    logger.warning(f"Unknown category '{value}' for feature {feature_name}, using default 0")
-                    return 0
-            elif isinstance(value, (int, float)):
-                return int(value)
-            else:
-                return 0
-
-        except Exception as e:
-            logger.error(f"Error encoding feature {feature_name}: {e}")
-            return 0
-
-    def _apply_standard_scaler(self, feature_name: str, value: float) -> float:
-        """应用 StandardScaler 到密集特征"""
-        try:
-            # ✅ FIX #2: CLIP 特征已经标准化，跳过 StandardScaler
-            # CLIP 模型输出的 embedding 特征已经归一化到 [-1, 1] 范围
-            # 如果再应用 StandardScaler 会破坏特征分布
-            CLIP_FEATURE_PREFIXES = ['cover_image_feat_', 'title_feat_', 'content_feat_',
-                                     'inner_image_feat_', 'tag_feat_']
-            if any(feature_name.startswith(prefix) for prefix in CLIP_FEATURE_PREFIXES):
-                # CLIP features are already normalized, skip scaling
-                return np.float32(value)
-
-            if not self.preprocessors or 'scalers' not in self.preprocessors:
-                logger.warning(f"No scalers available, returning raw value for {feature_name}")
-                return float(value)
-
-            scaler = self.preprocessors['scalers'].get(feature_name)
-            if scaler is None:
-                #logger.warning(f"No scaler found for feature {feature_name}, using raw value")
-                return float(value)
-
-            # 应用标准化
-            if isinstance(value, (int, float)):
-                # 强制使用 float32 输入，避免 sklearn 返回 float64
-                scaled_value = scaler.transform(np.array([[value]], dtype=np.float32))[0][0]
-                logger.info(f"scaled_value: {scaled_value}, raw value: {value}")
-                # 确保返回 float32 以兼容 MPS 设备
-                return np.float32(scaled_value)
-            else:
-                logger.warning(f"Non-numeric value for dense feature {feature_name}, using 0.0")
-                return np.float32(0.0)
-
-        except Exception as e:
-            logger.error(f"Error scaling feature {feature_name}: {e}")
-            return np.float32(value)
-
-    def _apply_pca_if_needed(self, features: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """如果训练时使用了 PCA，则应用 PCA 转换"""
-        try:
-            if not self.preprocessors or 'pca_transformers' not in self.preprocessors:
-                return features
-
-            pca_transformers = self.preprocessors['pca_transformers']
-            if not pca_transformers:
-                return features
-
-            # 处理每个 PCA 组
-            for pca_name, pca in pca_transformers.items():
-                original_features = []
-                original_feat_names = []
-
-                for feat_name in self.feature_names:
-                    if feat_name.startswith(f"{pca_name}_feat_"):
-                        if feat_name in features:
-                            # 确保收集的特征是 float32
-                            original_features.append(np.float32(features[feat_name][0]))
-                            original_feat_names.append(feat_name)
-
-                if original_features:
-                    # 应用 PCA - 显式指定 float32 dtype
-                    original_array = np.array(original_features, dtype=np.float32).reshape(1, -1)
-                    # PCA 返回 float64，立即转换为 float32
-                    pca_result = pca.transform(original_array)[0].astype(np.float32)
-
-                    # 替换原始特征为 PCA 特征
-                    for feat_name in original_feat_names:
-                        del features[feat_name]
-
-                    # 添加 PCA 特征（已经是 float32）
-                    n_components = len(pca_result)
-                    for i in range(n_components):
-                        pca_feat_name = f"{pca_name}_pca_{i}"
-                        features[pca_feat_name] = np.array([pca_result[i]], dtype=np.float32)
-
-                    logger.debug(f"Applied PCA for {pca_name}: {len(original_features)} → {n_components} dims")
-
-            return features
-
-        except Exception as e:
-            logger.error(f"Error applying PCA: {e}")
-            return features
-
     def _preprocess_features(self, features: Dict) -> Dict[str, np.ndarray]:
-        """
-        预处理特征（修复版本 - 应用训练时的预处理器）
-
-        应用顺序:
-        1. LabelEncoder for sparse features (categorical → integer)
-        2. StandardScaler for dense features (normalization)
-        3. PCA for CLIP features (optional dimensionality reduction)
-        """
+        """预处理特征"""
         try:
-            # 识别稀疏和密集特征
-            sparse_features, dense_features = self._get_sparse_and_dense_features()
-
-            # ========== Phase 2: 特征一致性分析 ==========
-            # 分析输入特征 vs 预期特征，帮助发现训练和推理的不一致
-            expected_features = set(self.feature_names)
-            provided_features = set(features.keys())
-            missing_features = expected_features - provided_features
-            extra_features = provided_features - expected_features
-
-            # 按特征类型分组缺失特征
-            missing_sparse = [f for f in missing_features if f in sparse_features]
-            missing_dense = [f for f in missing_features if f in dense_features]
-            missing_other = [f for f in missing_features if f not in sparse_features and f not in dense_features]
-
-            # 打印特征统计摘要
-            logger.info(f"📊 Feature Analysis: {len(expected_features)} expected, {len(provided_features)} provided, {len(missing_features)} missing")
-
-            # 详细显示缺失特征（限制输出数量）
-            if missing_sparse:
-                logger.warning(f"🔍 Missing {len(missing_sparse)} sparse features (showing first 10): {missing_sparse[:10]}")
-            if missing_dense:
-                logger.warning(f"🔍 Missing {len(missing_dense)} dense features (showing first 10): {missing_dense[:10]}")
-            if missing_other:
-                logger.debug(f"🔍 Missing {len(missing_other)} other features (CLIP/embeddings, showing first 10): {missing_other[:10]}")
-
-            # 显示额外提供的特征（可能是新增的）
-            if extra_features:
-                logger.debug(f"✨ Extra features provided (not in training): {list(extra_features)[:10]}")
-
-            # 显示存在的关键特征
-            key_features = ['note_id', 'title', 'content', 'cover_image', 'nickname', 'note_type']
-            present_key_features = [f for f in key_features if f in provided_features]
-            logger.info(f"✅ Present key features: {present_key_features}")
-            # ========== End Phase 2 ==========
-
+            # 简化的特征预处理逻辑
             processed = {}
-
-            # 处理每个特征
+            
             for feat_name in self.feature_names:
-                if feat_name in sparse_features:
-                    # 稀疏特征：应用 LabelEncoder
-                    raw_value = features.get(feat_name, '')
-                    encoded_value = self._apply_label_encoder(feat_name, raw_value)
-                    processed[feat_name] = np.array([encoded_value], dtype=np.int32)
-
-                elif feat_name in dense_features:
-                    # 密集特征：应用 StandardScaler
-                    raw_value = features.get(feat_name, 0.0)
-                    scaled_value = self._apply_standard_scaler(feat_name, raw_value)
-                    # 确保使用 float32（MPS 兼容）
-                    processed[feat_name] = np.array([float(scaled_value)], dtype=np.float32)
-
-                else:
-                    # 其他特征（如 CLIP embeddings）
-                    if feat_name in features:
-                        value = features[feat_name]
-                        if isinstance(value, (list, np.ndarray)):
-                            processed[feat_name] = np.array(value, dtype=np.float32).flatten()[:1]
-                        elif isinstance(value, (int, float)):
-                            processed[feat_name] = np.array([float(value)], dtype=np.float32)
-                        else:
-                            processed[feat_name] = np.array([0.0], dtype=np.float32)
+                if feat_name in features:
+                    value = features[feat_name]
+                    if isinstance(value, (int, float)):
+                        processed[feat_name] = np.array([float(value)], dtype=np.float32)
                     else:
                         processed[feat_name] = np.array([0.0], dtype=np.float32)
-
-            # 应用 PCA（如果训练时使用）
-            processed = self._apply_pca_if_needed(processed)
-
-            # ========== Phase 2: 特征处理统计 ==========
-            # 统计各类特征的处理情况
-            processed_sparse = sum(1 for f in processed.keys() if f in sparse_features)
-            processed_dense = sum(1 for f in processed.keys() if f in dense_features)
-            processed_other = len(processed) - processed_sparse - processed_dense
-
-            # 统计使用默认值的特征数量
-            features_with_defaults = len(missing_features)
-            default_rate = (features_with_defaults / len(expected_features) * 100) if expected_features else 0
-
-            logger.info(f"✅ Preprocessed {len(processed)} features: sparse={processed_sparse}/{len(sparse_features)}, "
-                       f"dense={processed_dense}/{len(dense_features)}, other={processed_other}")
-            logger.info(f"⚠️  Using default values for {features_with_defaults} features ({default_rate:.1f}%)")
-            # ========== End Phase 2 ==========
-
+                else:
+                    processed[feat_name] = np.array([0.0], dtype=np.float32)
+            
             return processed
-
+            
         except Exception as e:
-            logger.error(f"Feature preprocessing failed: {e}", exc_info=True)
+            logger.error(f"Feature preprocessing failed: {e}")
             # 返回默认特征
             return {feat_name: np.array([0.0], dtype=np.float32) for feat_name in self.feature_names}
     
@@ -747,20 +470,7 @@ class ModelInferenceService:
         try:
             # 根据任务映射提取预测值
             task_mapping = self.task_column_mapping
-
-            # ✅ FIX #1: 应用 label denormalization（从标准化空间转回原始空间）
-            # 训练时对标签做了 StandardScaler 标准化，预测值也是标准化后的
-            # 必须进行逆变换才能得到真实的预测值
-            if self.label_normalizer is not None:
-                logger.info(f"🔄 Applying label denormalization to predictions")
-                # pred_values 是 1D 数组，需要 reshape 成 2D (1, n_tasks)
-                pred_values_2d = pred_values.reshape(1, -1)
-                # 逆标准化：将标准化后的值转回原始尺度
-                denormalized = self.label_normalizer.inverse_transform(pred_values_2d, self.tasks)
-                # 转回 1D 数组
-                pred_values = denormalized.flatten()
-                logger.info(f"✅ Denormalized predictions: {pred_values}")
-
+            
             # 默认值
             predictions = {
                 'ctr': 0.05,
@@ -774,24 +484,12 @@ class ModelInferenceService:
                 'impression': 8.0,
                 'sort_score': 0.75
             }
-
+            
             # 从预测值中提取
             for i, task in enumerate(self.tasks):
                 if i < len(pred_values):
                     predictions[task] = float(pred_values[i])
-
-            # ✅ FIX #3: 预测值范围验证和修正
-            # 对于率类指标（ctr, like_rate等），确保在合理范围内 [0, 1]
-            rate_tasks = ['ctr', 'like_rate', 'fav_rate', 'comment_rate', 'share_rate',
-                         'follow_rate', 'interaction_rate', 'ces_rate', 'sort_score']
-            for task in rate_tasks:
-                if task in predictions:
-                    # 将异常值限制在 [0, 1] 范围内
-                    original_value = predictions[task]
-                    predictions[task] = max(0.0, min(1.0, predictions[task]))
-                    if abs(original_value - predictions[task]) > 0.01:
-                        logger.warning(f"⚠️  Task {task} prediction {original_value:.4f} clipped to {predictions[task]:.4f}")
-
+            
             # 处理impression（从log转换）
             impression_log = predictions.get('impression', 8.0)
             impression = np.exp(impression_log) if impression_log > 0 else 1000.0

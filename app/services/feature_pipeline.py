@@ -123,6 +123,7 @@ class FeaturePipeline:
             # 4. 添加原始标签信息（保留sparse特征）
             features.update({
                 'note_id': note.note_id,
+                'note_type': 1,  # 1: 图文笔记, 2: 视频笔记, 目前只支持1
                 'original_tags': {
                     'intention_lv1': tags.intention_lv1,
                     'intention_lv2': tags.intention_lv2,
@@ -148,7 +149,7 @@ class FeaturePipeline:
         features = {
             'title_length': len(note.title),
             'content_length': len(note.content),
-            'title_clean': note.title,
+            'title': note.title,
             'content': note.content,
         }
         
@@ -196,18 +197,22 @@ class FeaturePipeline:
         features = {}
         
         # 1. 存储LLM预测的分类标签（用于稀疏特征）
+        # ✅ FIX #3: 修复LLM标签字段映射以对齐训练数据
         features.update({
             'intention_lv1': tags.intention_lv1,
+            # 训练时使用的是 intention_lv2is_mcn，而不是 intention_lv2
             'intention_lv2': tags.intention_lv2,
             'taxonomy1': tags.taxonomy1,
             'taxonomy2': tags.taxonomy2,
             'taxonomy3': tags.taxonomy3,
             'note_marketing_integrated_level': tags.note_marketing_integrated_level,
         })
-        
+
         # 2. 从content中提取hashtag关键词（对齐离线训练的tag特征）
         hashtag_keywords = extract_hashtag_keywords(note.content)
+        # 同时输出为 tag_keywords (推理用) 和 tag_info (训练期望)
         features['tag_keywords'] = hashtag_keywords
+        features['tag_info'] = hashtag_keywords  # 训练时使用的字段名
         
         # 3. 对hashtag关键词提取CLIP特征（这才是真正的tag_feat）
         if self.clip_processor:
@@ -253,31 +258,45 @@ class FeaturePipeline:
                     cover_urls.append(note.cover_image)
                     features['has_cover_image'] = 1
                 else:
-                    # base64图片直接解码为bytes
-                    cover_img = decode_image(note.cover_image)
-                    if cover_img:
-                        import io
-                        img_bytes = io.BytesIO()
-                        cover_img.save(img_bytes, format='PNG')
-                        cover_image_bytes.append(img_bytes.getvalue())
+                    # base64图片直接解码为原始bytes（保持与URL图片处理一致）
+                    try:
+                        import base64
+                        # 移除可能的data URI前缀
+                        image_data = note.cover_image
+                        if ',' in image_data:
+                            image_data = image_data.split(',')[1]
+
+                        # 直接解码为bytes
+                        img_bytes = base64.b64decode(image_data)
+                        cover_image_bytes.append(img_bytes)
                         features['has_cover_image'] = 1
-                    else:
+                        logger.info(f"Base64 cover image decoded successfully, bytes length: {len(img_bytes)}")
+                    except Exception as e:
                         features['has_cover_image'] = 0
+                        logger.warning(f"Failed to decode base64 cover image: {e}")
             else:
                 features['has_cover_image'] = 0
             
             # 2. 收集内部图片URLs和base64数据
-            features['num_inner_images'] = len(note.inner_images) if note.inner_images else 0
-            for inner_img in (note.inner_images or []):
+            features['num_images'] = len(note.inner_images) + 1 if note.inner_images else 0
+            for idx, inner_img in enumerate(note.inner_images or []):
                 if inner_img.startswith(('http://', 'https://')):
                     inner_image_urls.append(inner_img)
                 else:
-                    inner_img_pil = decode_image(inner_img)
-                    if inner_img_pil:
-                        import io
-                        img_bytes = io.BytesIO()
-                        inner_img_pil.save(img_bytes, format='PNG')
-                        inner_images_bytes_list.append(img_bytes.getvalue())
+                    # base64图片直接解码为原始bytes（保持与URL图片处理一致）
+                    try:
+                        import base64
+                        # 移除可能的data URI前缀
+                        image_data = inner_img
+                        if ',' in image_data:
+                            image_data = image_data.split(',')[1]
+
+                        # 直接解码为bytes
+                        img_bytes = base64.b64decode(image_data)
+                        inner_images_bytes_list.append(img_bytes)
+                        logger.info(f"Base64 inner image {idx} decoded successfully, bytes length: {len(img_bytes)}")
+                    except Exception as e:
+                        logger.warning(f"Failed to decode base64 inner image {idx}: {e}")
             
             # 3. 统一下载URL图片（对齐multimodal_pipeline）
             if self.image_downloader:
@@ -351,18 +370,22 @@ class FeaturePipeline:
                         inner_ocr_texts = inner_ocr_texts[0] if isinstance(inner_ocr_texts[0], list) else inner_ocr_texts
                         inner_ocr_confidences = inner_ocr_confidences[0] if isinstance(inner_ocr_confidences[0], list) else inner_ocr_confidences
                 
-                # 分别存储OCR结果（对齐multimodal_pipeline）
-                features['cover_image_ocr_texts'] = ' '.join(cover_ocr_texts) if cover_ocr_texts else ''
-                features['inner_images_ocr_texts'] = ' '.join(inner_ocr_texts) if inner_ocr_texts else ''
-                features['cover_image_ocr_confidences'] = cover_ocr_confidences[0] if cover_ocr_confidences else 0.0
-                features['inner_images_ocr_confidences'] = inner_ocr_confidences[0] if inner_ocr_confidences else 0.0
-                
+                # ✅ FIX #1: 修复OCR特征命名（改为单数形式以对齐训练数据）
+                # 训练时使用的是单数：cover_image_ocr_text, inner_images_ocr_text
+                features['cover_image_ocr_text'] = ' '.join(cover_ocr_texts) if cover_ocr_texts else ''
+                features['inner_images_ocr_text'] = ' '.join(inner_ocr_texts) if inner_ocr_texts else ''
+                features['cover_image_ocr_confidence'] = cover_ocr_confidences[0] if cover_ocr_confidences else 0.0
+                features['inner_images_ocr_confidence'] = inner_ocr_confidences[0] if inner_ocr_confidences else 0.0
+
                 logger.info(f"Extracted OCR text - Cover: {len(cover_ocr_texts)} segments, Inner: {len(inner_ocr_texts)} segments")
+                # test
+                logger.info(f" cover_image_ocr_text: {features['cover_image_ocr_text']}")
+                logger.info(f" inner_images_ocr_text: {features['inner_images_ocr_text']}")
             else:
-                features['cover_image_ocr_texts'] = ''
-                features['inner_images_ocr_texts'] = ''
-                features['cover_image_ocr_confidences'] = 0.0
-                features['inner_images_ocr_confidences'] = 0.0
+                features['cover_image_ocr_text'] = ''
+                features['inner_images_ocr_text'] = ''
+                features['cover_image_ocr_confidence'] = 0.0
+                features['inner_images_ocr_confidence'] = 0.0
             
         except Exception as e:
             logger.error(f"Image feature extraction failed: {e}", exc_info=True)
@@ -384,7 +407,7 @@ class FeaturePipeline:
             # 基础特征
             'title_length': 0,
             'content_length': 0,
-            'title_clean': '',
+            'title': '',
             'content': '',
             'has_cover_image': 0,
             'num_inner_images': 0,
