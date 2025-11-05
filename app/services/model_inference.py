@@ -66,7 +66,6 @@ if TORCH_AVAILABLE:
         # Concatenate with explicit float32 dtype
         concatenated = np.concatenate(x, axis=-1)
         if concatenated.dtype == np.float64:
-            logger.debug("🔄 Converting concatenated features from float64 to float32")
             concatenated = concatenated.astype(np.float32)
 
         # Create tensor dataset
@@ -83,11 +82,11 @@ if TORCH_AVAILABLE:
 
         # Return float32 predictions instead of float64
         result = np.concatenate(pred_ans).astype(np.float32)
-        logger.debug(f"✅ MPS-safe predict completed, output dtype: {result.dtype}")
+        logger.debug(f"MPS-safe predict completed, output dtype: {result.dtype}")
         return result
 
     BaseModel.predict = _mps_safe_predict
-    logger.info("✅ Applied comprehensive MPS compatibility patch to DeepCTR BaseModel")
+    logger.info("Applied comprehensive MPS compatibility patch to DeepCTR BaseModel")
 # ========== End MPS Compatibility Patch ==========
 
 
@@ -121,7 +120,7 @@ class ModelInferenceService:
         logger.info("="*60)
         
         if not TORCH_AVAILABLE:
-            logger.error("❌ PyTorch not available, cannot load model")
+            logger.error("PyTorch not available, cannot load model")
             return
         
         # 按照MTLPredictor的逻辑初始化
@@ -144,12 +143,25 @@ class ModelInferenceService:
             # 5. 加载标签归一化器
             logger.info("Loading label normalizer...")
             self._load_label_normalizer()
-            
+
+            # 验证 label_normalizer 状态
+            if self.label_normalizer is None:
+                logger.error("CRITICAL: Label normalizer is None!")
+                logger.error("   Predictions will NOT be denormalized - this will cause wrong predictions!")
+                logger.error("   Expected file: models/label_normalizer.pkl")
+            else:
+                logger.info("Label normalizer validation:")
+                logger.info(f"   Normalization method: {getattr(self.label_normalizer, 'normalization_method', 'unknown')}")
+                if hasattr(self.label_normalizer, 'fitted_tasks'):
+                    logger.info(f"   Fitted tasks: {self.label_normalizer.fitted_tasks}")
+                if hasattr(self.label_normalizer, 'normalizers'):
+                    logger.info(f"   Number of normalizers: {len(self.label_normalizer.normalizers)}")
+
             # 6. 加载训练信息
             logger.info("Loading training info...")
             self._load_training_info()
             
-            logger.info("✅ Model Inference Service initialized successfully")
+            logger.info("Model Inference Service initialized successfully")
             logger.info(f"Model type: {self.training_info.get('model_type', 'unknown')}")
             logger.info(f"Tasks: {', '.join(self.tasks)}")
             
@@ -158,7 +170,7 @@ class ModelInferenceService:
                 self._warmup()
                 
         except Exception as e:
-            logger.error(f"❌ Failed to initialize model inference service: {e}", exc_info=True)
+            logger.error(f"Failed to initialize model inference service: {e}", exc_info=True)
     
     def _get_device(self) -> str:
         """获取推理设备"""
@@ -192,7 +204,7 @@ class ModelInferenceService:
                 logger.info(f"Loading complete model from {complete_model_path}")
                 self.model = torch.load(complete_model_path, map_location=self.device)
                 self.model.eval()
-                logger.info(f"✅ Complete model loaded successfully: {self.model.__class__.__name__}")
+                logger.info(f"Complete model loaded successfully: {self.model.__class__.__name__}")
                 return
             except Exception as e:
                 logger.warning(f"Failed to load complete model: {e}")
@@ -216,16 +228,15 @@ class ModelInferenceService:
             # 4. 加载权重
             weights_file = self.checkpoint_dir / "model.pth"
             if weights_file.exists():
-                logger.info(f"Loading model weights from {weights_file}")
                 state_dict = torch.load(weights_file, map_location=self.device)
                 self.model.load_state_dict(state_dict)
-                logger.info("✅ Model weights loaded successfully")
+                logger.info(f"Model weights loaded from {weights_file}")
             else:
                 logger.error("Model weights not found!")
                 return
             
             self.model.eval()
-            logger.info(f"✅ Model rebuilt successfully: {self.model.__class__.__name__}")
+            logger.info(f"Model rebuilt successfully: {self.model.__class__.__name__}")
             
         except Exception as e:
             logger.error(f"Failed to rebuild model: {e}", exc_info=True)
@@ -236,10 +247,10 @@ class ModelInferenceService:
         config_file = self.checkpoint_dir / "model_config.json"
         if not config_file.exists():
             raise FileNotFoundError(f"Model config not found: {config_file}")
-        
+
         with open(config_file, 'r') as f:
             config_data = json.load(f)
-        
+
         logger.info(f"Loaded model config: {config_data.get('model_type', 'unknown')}")
         return config_data
     
@@ -248,12 +259,14 @@ class ModelInferenceService:
         feature_file = self.checkpoint_dir / "feature_columns.json"
         if not feature_file.exists():
             raise FileNotFoundError(f"Feature columns not found: {feature_file}")
-        
+
         with open(feature_file, 'r') as f:
             feature_data = json.load(f)
-        
+
         # 重建特征列对象
         feature_columns = []
+        sparse_count = 0
+        dense_count = 0
         for feat_info in feature_data:
             if feat_info['type'] == 'SparseFeat':
                 feature_columns.append(SparseFeat(
@@ -262,14 +275,16 @@ class ModelInferenceService:
                     embedding_dim=feat_info['embedding_dim'],
                     dtype=feat_info.get('dtype', 'int32')
                 ))
+                sparse_count += 1
             elif feat_info['type'] == 'DenseFeat':
                 feature_columns.append(DenseFeat(
                     name=feat_info['name'],
                     dimension=feat_info.get('dimension', 1),
                     dtype=feat_info.get('dtype', 'float32')
                 ))
-        
-        logger.info(f"Loaded {len(feature_columns)} feature columns for model rebuild")
+                dense_count += 1
+
+        logger.info(f"Loaded {len(feature_columns)} feature columns (Sparse: {sparse_count}, Dense: {dense_count})")
         return feature_columns
     
     def _create_model(self, model_config: Dict[str, Any], feature_columns: List) -> nn.Module:
@@ -278,8 +293,8 @@ class ModelInferenceService:
         
         if model_type == 'PNN_MMOE':
             # 导入PNN_MMOE模型
-            from training.base.pnn_mmoe_model import PNN_MMOE
-            
+            from offline_training.training.base.pnn_mmoe_model import PNN_MMOE
+
             pnn_mmoe_config = model_config.get('pnn_mmoe_config', {})
             mmoe_config = pnn_mmoe_config.get('mmoe', {})
             pnn_config = pnn_mmoe_config.get('pnn', {})
@@ -287,14 +302,15 @@ class ModelInferenceService:
             model = PNN_MMOE(
                 dnn_feature_columns=feature_columns,
                 num_tasks=len(model_config.get('tasks', [])),
-                task_types=['regression'] * len(model_config.get('tasks', [])),
+                task_types=['binary'] * len(model_config.get('tasks', [])),
                 task_names=model_config.get('tasks', []),
+                use_inner_product=pnn_config.get('use_inner_product', True),
+                use_outter_product=pnn_config.get('use_outter_product', False),
                 num_experts=mmoe_config.get('num_experts', 3),
                 expert_dnn_hidden_units=tuple(mmoe_config.get('expert_dims', [128, 64])),
                 gate_dnn_hidden_units=tuple(mmoe_config.get('gate_dims', [32])),
                 tower_dnn_hidden_units=tuple(mmoe_config.get('tower_dims', [64, 32])),
-                use_inner_product=pnn_config.get('use_inner_product', True),
-                use_outter_product=pnn_config.get('use_outter_product', False),
+                dnn_dropout=model_config.get('dropout', 0.1),
                 l2_reg_embedding=model_config.get('l2_reg_embedding', 1e-5),
                 l2_reg_dnn=model_config.get('l2_reg_dnn', 0),
                 device=self.device
@@ -312,7 +328,7 @@ class ModelInferenceService:
             try:
                 with open(preprocessor_file, 'rb') as f:
                     self.preprocessors = pickle.load(f)
-                logger.info("✅ Preprocessors loaded successfully")
+                logger.info("Preprocessors loaded successfully")
             except Exception as e:
                 logger.error(f"Failed to load preprocessors: {e}")
                 self.preprocessors = None
@@ -332,7 +348,7 @@ class ModelInferenceService:
                 self.feature_names = [feat['name'] for feat in feature_data]
                 self.feature_columns = feature_data
                 
-                logger.info(f"✅ Loaded {len(self.feature_names)} feature columns")
+                logger.info(f"Loaded {len(self.feature_names)} feature columns")
             except Exception as e:
                 logger.error(f"Failed to load feature columns: {e}")
                 self.feature_columns = []
@@ -349,7 +365,7 @@ class ModelInferenceService:
             try:
                 with open(normalizer_file, 'rb') as f:
                     self.label_normalizer = pickle.load(f)
-                logger.info("✅ Label normalizer loaded successfully")
+                logger.info("Label normalizer loaded successfully")
             except Exception as e:
                 logger.error(f"Failed to load label normalizer: {e}")
                 self.label_normalizer = None
@@ -368,7 +384,7 @@ class ModelInferenceService:
                 self.tasks = self.training_info.get('tasks', [])
                 self.task_column_mapping = self.training_info.get('task_column_mapping', {})
                 
-                logger.info(f"✅ Training info loaded: {len(self.tasks)} tasks")
+                logger.info(f"Training info loaded: {len(self.tasks)} tasks")
             except Exception as e:
                 logger.error(f"Failed to load training info: {e}")
                 self.training_info = {}
@@ -397,7 +413,7 @@ class ModelInferenceService:
             with torch.no_grad():
                 _ = self.model.predict(dummy_input, batch_size=1)
             
-            logger.info("✅ Model warmed up successfully")
+            logger.info("Model warmed up successfully")
             
         except Exception as e:
             logger.warning(f"⚠️ Model warmup failed: {e}")
@@ -424,13 +440,10 @@ class ModelInferenceService:
             # 预处理特征
             logger.debug("Step 1: Starting _preprocess_features...")
             processed_features = self._preprocess_features(features)
-            logger.debug(f"Step 1 ✅: _preprocess_features completed, feature dtypes: {[f.dtype for f in processed_features.values() if isinstance(f, np.ndarray)][:5]}")
 
             # 执行预测
-            logger.debug("Step 2: Starting model.predict...")
             with torch.no_grad():
                 predictions = self.model.predict(processed_features, batch_size=1)
-            logger.debug(f"Step 2 ✅: model.predict completed, predictions dtype: {predictions.dtype if isinstance(predictions, np.ndarray) else type(predictions)}")
 
             # Safety check: Convert any remaining float64 to float32 for MPS compatibility
             if isinstance(predictions, np.ndarray) and predictions.dtype == np.float64:
@@ -440,13 +453,12 @@ class ModelInferenceService:
             # 后处理预测结果
             logger.debug("Step 3: Starting _postprocess_predictions...")
             result = self._postprocess_predictions(predictions, note_id)
-            logger.debug("Step 3 ✅: _postprocess_predictions completed")
 
-            logger.info(f"✅ Model inference completed for note: {note_id}")
+            logger.info(f"Model inference completed for note: {note_id}")
             return result
 
         except Exception as e:
-            logger.error(f"❌ Prediction failed for note {note_id}: {e}", exc_info=True)
+            logger.error(f"Prediction failed for note {note_id}: {e}", exc_info=True)
             return self._get_mock_prediction(note_id)
     
     def predict_batch(self, features_list: List[Dict]) -> List[PredictionOutput]:
@@ -492,11 +504,11 @@ class ModelInferenceService:
                 result = self._postprocess_single_prediction(pred_values, note_id)
                 results.append(result)
             
-            logger.info(f"✅ Batch inference completed for {len(features_list)} notes")
+            logger.info(f"Batch inference completed for {len(features_list)} notes")
             return results
             
         except Exception as e:
-            logger.error(f"❌ Batch prediction failed: {e}", exc_info=True)
+            logger.error(f"Batch prediction failed: {e}", exc_info=True)
             return [self._get_mock_prediction(f.get('note_id')) for f in features_list]
     
     def _get_sparse_and_dense_features(self):
@@ -548,7 +560,7 @@ class ModelInferenceService:
     def _apply_standard_scaler(self, feature_name: str, value: float) -> float:
         """应用 StandardScaler 到密集特征"""
         try:
-            # ✅ FIX #2: CLIP 特征已经标准化，跳过 StandardScaler
+            # FIX #2: CLIP 特征已经标准化，跳过 StandardScaler
             # CLIP 模型输出的 embedding 特征已经归一化到 [-1, 1] 范围
             # 如果再应用 StandardScaler 会破坏特征分布
             CLIP_FEATURE_PREFIXES = ['cover_image_feat_', 'title_feat_', 'content_feat_',
@@ -647,21 +659,13 @@ class ModelInferenceService:
             missing_features = expected_features - provided_features
             extra_features = provided_features - expected_features
 
-            # 按特征类型分组缺失特征
-            missing_sparse = [f for f in missing_features if f in sparse_features]
-            missing_dense = [f for f in missing_features if f in dense_features]
-            missing_other = [f for f in missing_features if f not in sparse_features and f not in dense_features]
-
             # 打印特征统计摘要
-            logger.info(f"📊 Feature Analysis: {len(expected_features)} expected, {len(provided_features)} provided, {len(missing_features)} missing")
+            logger.info(f"Feature Analysis: {len(expected_features)} expected, {len(provided_features)} provided, {len(missing_features)} missing")
 
             # 详细显示缺失特征（限制输出数量）
-            if missing_sparse:
-                logger.warning(f"🔍 Missing {len(missing_sparse)} sparse features (showing first 10): {missing_sparse[:10]}")
-            if missing_dense:
-                logger.warning(f"🔍 Missing {len(missing_dense)} dense features (showing first 10): {missing_dense[:10]}")
+            missing_other = [f for f in missing_features if f not in sparse_features and f not in dense_features]
             if missing_other:
-                logger.debug(f"🔍 Missing {len(missing_other)} other features (CLIP/embeddings, showing first 10): {missing_other[:10]}")
+                logger.debug(f"Missing {len(missing_other)} other features (CLIP/embeddings, showing first 10): {missing_other[:10]}")
 
             # 显示额外提供的特征（可能是新增的）
             if extra_features:
@@ -670,7 +674,7 @@ class ModelInferenceService:
             # 显示存在的关键特征
             key_features = ['note_id', 'title', 'content', 'cover_image', 'nickname', 'note_type']
             present_key_features = [f for f in key_features if f in provided_features]
-            logger.info(f"✅ Present key features: {present_key_features}")
+            logger.info(f"Present key features: {present_key_features}")
             # ========== End Phase 2 ==========
 
             processed = {}
@@ -716,11 +720,35 @@ class ModelInferenceService:
             features_with_defaults = len(missing_features)
             default_rate = (features_with_defaults / len(expected_features) * 100) if expected_features else 0
 
-            logger.info(f"✅ Preprocessed {len(processed)} features: sparse={processed_sparse}/{len(sparse_features)}, "
+            logger.info(f"Preprocessed {len(processed)} features: sparse={processed_sparse}/{len(sparse_features)}, "
                        f"dense={processed_dense}/{len(dense_features)}, other={processed_other}")
-            logger.info(f"⚠️  Using default values for {features_with_defaults} features ({default_rate:.1f}%)")
+            logger.info(f"Using default values for {features_with_defaults} features ({default_rate:.1f}%)")
             # ========== End Phase 2 ==========
 
+            # ========== 特征详细诊断：保存所有特征名和值用于离在线对比 ==========
+            
+            import json
+            from pathlib import Path
+            try:
+                features_dict = {}
+                for feat_name, feat_value in processed.items():
+                    # 将numpy数组转为Python列表
+                    if isinstance(feat_value, np.ndarray):
+                        features_dict[feat_name] = feat_value.tolist()
+                    else:
+                        features_dict[feat_name] = float(feat_value) if isinstance(feat_value, (int, float)) else str(feat_value)
+
+                # 保存到JSON文件
+                output_file = Path("online_features.json")
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(features_dict, f, indent=2, ensure_ascii=False)
+
+
+                # 打印前10个稀疏特征和前10个密集特征作为样本
+            except Exception as e:
+                logger.warning(f"Failed to save features for diagnosis: {e}")
+            # ========== End 特征诊断 ==========
+            
             return processed
 
         except Exception as e:
@@ -745,21 +773,20 @@ class ModelInferenceService:
     def _postprocess_single_prediction(self, pred_values, note_id: Optional[str] = None) -> PredictionOutput:
         """后处理单个预测结果"""
         try:
-            # 根据任务映射提取预测值
-            task_mapping = self.task_column_mapping
-
-            # ✅ FIX #1: 应用 label denormalization（从标准化空间转回原始空间）
+            # FIX #1: 应用 label denormalization（从标准化空间转回原始空间）
             # 训练时对标签做了 StandardScaler 标准化，预测值也是标准化后的
             # 必须进行逆变换才能得到真实的预测值
             if self.label_normalizer is not None:
-                logger.info(f"🔄 Applying label denormalization to predictions")
                 # pred_values 是 1D 数组，需要 reshape 成 2D (1, n_tasks)
                 pred_values_2d = pred_values.reshape(1, -1)
+
                 # 逆标准化：将标准化后的值转回原始尺度
                 denormalized = self.label_normalizer.inverse_transform(pred_values_2d, self.tasks)
+
                 # 转回 1D 数组
                 pred_values = denormalized.flatten()
-                logger.info(f"✅ Denormalized predictions: {pred_values}")
+            else:
+                logger.error("CRITICAL: No label_normalizer available - predictions will be in wrong scale!")
 
             # 默认值
             predictions = {
@@ -780,22 +807,19 @@ class ModelInferenceService:
                 if i < len(pred_values):
                     predictions[task] = float(pred_values[i])
 
-            # ✅ FIX #3: 预测值范围验证和修正
+            # FIX #3: 预测值范围验证和修正
             # 对于率类指标（ctr, like_rate等），确保在合理范围内 [0, 1]
             rate_tasks = ['ctr', 'like_rate', 'fav_rate', 'comment_rate', 'share_rate',
                          'follow_rate', 'interaction_rate', 'ces_rate', 'sort_score']
             for task in rate_tasks:
                 if task in predictions:
                     # 将异常值限制在 [0, 1] 范围内
-                    original_value = predictions[task]
                     predictions[task] = max(0.0, min(1.0, predictions[task]))
-                    if abs(original_value - predictions[task]) > 0.01:
-                        logger.warning(f"⚠️  Task {task} prediction {original_value:.4f} clipped to {predictions[task]:.4f}")
 
             # 处理impression（从log转换）
             impression_log = predictions.get('impression', 8.0)
             impression = np.exp(impression_log) if impression_log > 0 else 1000.0
-            
+
             return PredictionOutput(
                 note_id=note_id,
                 ctr=predictions['ctr'],

@@ -52,3 +52,4 @@ htmlcov/
 data/
 *.csv
 *.json
+offline_training
