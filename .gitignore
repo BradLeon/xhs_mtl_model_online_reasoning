@@ -51,4 +51,5 @@ htmlcov/
 # Data
 data/
 *.csv
-*.jsonoffline_training
+*.json
+offline_training
